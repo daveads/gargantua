@@ -11,48 +11,37 @@ use crate::error::Error;
 pub enum QueryPlan<Value> {
     Parallel(Vec<QueryPlan<Value>>),
     Sequence(Vec<QueryPlan<Value>>),
-    Fetch {
-        service: Graph,
-        query: QueryOperation<Value>,
-        representations: Option<SelectionSet<Value>>,
-        type_name: TypeName,
-    },
+    Fetch(FetchDefinition<Value>),
     Flatten {
         select: Lens,
         plan: Box<QueryPlan<Value>>,
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct QueryOperation<Value> {
+#[derive(Debug, Clone, Setters)]
+pub struct FetchDefinition<Value> {
     pub name: Option<String>,
-    pub ty: TypeName,
     pub arguments: Vec<Argument<Value>>,
+    pub variables: Vec<VariableDefinition<Value>>,
     pub directives: Vec<Directive<Value>>,
     pub selection_set: SelectionSet<Value>,
+    pub representations: Option<SelectionSet<Value>>,
+    pub type_name: TypeName,
+    pub service: Option<Graph>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariableDefinition<Value> {
+    pub name: String,
+    pub type_name: TypeName,
+    pub nullable: bool,
+    pub directives: Vec<Directive<Value>>,
+    pub default_value: Option<Value>,
 }
 
 impl QueryPlan<async_graphql_value::Value> {
-    pub fn fetch(
-        name: Option<String>,
-        service: Graph,
-        type_name: TypeName,
-        query: SelectionSet<async_graphql_value::Value>,
-        directives: Vec<Directive<async_graphql_value::Value>>,
-        arguments: Vec<Argument<async_graphql_value::Value>>,
-    ) -> Self {
-        QueryPlan::Fetch {
-            service,
-            query: QueryOperation {
-                selection_set: query,
-                ty: type_name.clone(),
-                directives,
-                name,
-                arguments,
-            },
-            representations: None,
-            type_name,
-        }
+    pub fn fetch(fetch: FetchDefinition<async_graphql_value::Value>) -> Self {
+        QueryPlan::Fetch(fetch)
     }
 }
 
@@ -63,43 +52,26 @@ impl QueryPlan<async_graphql_value::Value> {
         let mut parallel = Vec::new();
 
         // TODO: handle fragments
-        // TODO: use named operations
         for (name, Positioned { node: op, .. }) in doc.operations.iter() {
             let name = name.map(|n| n.to_string());
-            let selection = SelectionSet::from(&op.selection_set.node);
+            let selection_set = SelectionSet::from(&op.selection_set.node);
             let type_name = TypeName::new(&op.ty.to_string());
-            let directives = op
-                .directives
-                .clone()
-                .into_iter()
-                .map(|Positioned { node: dir_node, .. }| {
-                    let arguments = dir_node
-                        .arguments
-                        .into_iter()
-                        .map(
-                            |(
-                                Positioned { node: name_node, .. },
-                                Positioned { node: arg_node, .. },
-                            )| {
-                                Argument { name: name_node.to_string(), value: arg_node }
-                            },
-                        )
-                        .collect();
+            let directives = extract_directives(op.directives.clone());
+            let variables = extract_variables(op.variable_definitions.clone());
 
-                    Directive {
-                        name: dir_node.name.into_inner().to_string(),
-                        arguments: arguments,
-                    }
-                })
-                .collect();
+            let fetch = FetchDefinition {
+                name,
+                type_name,
+                arguments: Vec::new(),
+                variables,
+                directives,
+                selection_set,
+                representations: None,
+                service: None,
+            };
 
-            // TODO: parse arguments
-            let arguments = Vec::new();
-
-            let service = Graph::new("");
-            parallel.push(QueryPlan::fetch(
-                name, service, type_name, selection, directives, arguments,
-            ));
+            let fetch_op = QueryPlan::fetch(fetch);
+            parallel.push(fetch_op);
         }
 
         Ok(QueryPlan::Parallel(parallel))
@@ -271,7 +243,9 @@ impl Lens {
             }
             Lens::ForEach(local_lens) => match value {
                 serde_json::Value::Array(vec) => serde_json::Value::Array(
-                    vec.into_iter().map(|v| local_lens.set(v, other_value.clone())).collect(),
+                    vec.into_iter()
+                        .map(|v| local_lens.set(v, other_value.clone()))
+                        .collect(),
                 ),
                 serde_json::Value::Object(map) => serde_json::Value::Object(
                     map.into_iter()
@@ -300,40 +274,9 @@ impl From<&Q::SelectionSet> for SelectionSet<async_graphql_value::Value> {
                         .as_ref()
                         .map(|alias| alias.clone().into_inner().to_string());
 
-                    let arguments = node
-                        .arguments
-                        .clone()
-                        .into_iter()
-                        .map(
-                            |(
-                                Positioned { node: name_node, .. },
-                                Positioned { node: arg_node, .. },
-                            )| {
-                                Argument { name: name_node.to_string(), value: arg_node }
-                            },
-                        )
-                        .collect::<Vec<_>>();
+                    let arguments = extract_arguments(node.arguments.clone());
 
-                    let directives = node
-                        .directives
-                        .clone()
-                        .into_iter()
-                        .map(|Positioned { node: directive_node, .. }| {
-                            let arguments = directive_node
-                                .arguments
-                                .into_iter()
-                                .map(
-                                    |(
-                                        Positioned { node: name_node, .. },
-                                        Positioned { node: arg_node, .. },
-                                    )| {
-                                        Argument { name: name_node.to_string(), value: arg_node }
-                                    },
-                                )
-                                .collect();
-                            Directive { name: directive_node.name.to_string(), arguments }
-                        })
-                        .collect::<Vec<_>>();
+                    let directives = extract_directives(node.directives.clone());
 
                     let field =
                         Field::new(field_name, SelectionSet::from(&node.selection_set.node))
@@ -353,6 +296,59 @@ impl From<&Q::SelectionSet> for SelectionSet<async_graphql_value::Value> {
         }
         SelectionSet(selection_set)
     }
+}
+
+fn extract_directives(
+    directives: Vec<Positioned<Q::Directive>>,
+) -> Vec<Directive<async_graphql_value::Value>> {
+    directives
+        .into_iter()
+        .map(|Positioned { node: dir_node, .. }| {
+            let arguments = extract_arguments(dir_node.arguments);
+
+            Directive {
+                name: dir_node.name.into_inner().to_string(),
+                arguments: arguments,
+            }
+        })
+        .collect()
+}
+
+fn extract_arguments(
+    arguments: Vec<(
+        Positioned<async_graphql_value::Name>,
+        Positioned<async_graphql_value::Value>,
+    )>,
+) -> Vec<Argument<async_graphql_value::Value>> {
+    arguments
+        .into_iter()
+        .map(
+            |(Positioned { node: name_node, .. }, Positioned { node: arg_node, .. })| Argument {
+                name: name_node.to_string(),
+                value: arg_node,
+            },
+        )
+        .collect()
+}
+
+fn extract_variables(
+    variable_definitions: Vec<Positioned<Q::VariableDefinition>>,
+) -> Vec<VariableDefinition<async_graphql_value::Value>> {
+    variable_definitions
+        .into_iter()
+        .map(
+            |Positioned { node: variable_node, .. }| VariableDefinition {
+                name: variable_node.name.node.to_string(),
+                type_name: TypeName::new(&variable_node.var_type.node.base.to_string()),
+                nullable: variable_node.var_type.node.nullable,
+                directives: extract_directives(variable_node.directives.clone()),
+                default_value: variable_node
+                    .default_value()
+                    .cloned()
+                    .map(|cv| cv.into_value()),
+            },
+        )
+        .collect()
 }
 
 #[cfg(test)]

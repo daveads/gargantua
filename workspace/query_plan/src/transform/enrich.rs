@@ -3,7 +3,7 @@ use std::{marker::PhantomData, rc::Rc};
 use blueprint::{Index, QueryField};
 use valid::{Transform, Valid, Validator};
 
-use crate::{QueryOperation, QueryPlan, SelectionSet};
+use crate::{FetchDefinition, QueryPlan, SelectionSet};
 
 pub struct Enrich<Value> {
     index: Rc<Index>,
@@ -67,10 +67,14 @@ impl<Value: Clone> Enrich<Value> {
                 field.join_field(field_def.join_fields.clone())
             };
 
-            let type_name = field_def.of_type.as_type_str();
-            let selection = field.selections.clone();
-            self.iter_sel(selection, &type_name)
-                .map(|selection_set| field.selections(selection_set))
+            if !field.selections.is_empty() {
+                let type_name = field_def.of_type.as_type_str();
+                let selection = field.selections.clone();
+                self.iter_sel(selection, &type_name)
+                    .map(|selection_set| field.selections(selection_set))
+            } else {
+                Valid::succeed(field)
+            }
         })
         .map(|fields| SelectionSet::new(fields))
     }
@@ -81,13 +85,28 @@ impl<Value: Clone> Enrich<Value> {
         container_type: &str,
     ) -> Valid<QueryPlan<Value>, String> {
         match query {
-            QueryPlan::Fetch { service, query, representations, type_name } => self
-                .iter_sel(query.selection_set, container_type)
-                .map(|selection_set| QueryPlan::Fetch {
-                    service,
-                    query: QueryOperation { selection_set },
-                    representations,
-                    type_name,
+            QueryPlan::Fetch(FetchDefinition {
+                name,
+                arguments,
+                variables,
+                directives,
+                selection_set,
+                representations,
+                type_name,
+                service,
+            }) => self
+                .iter_sel(selection_set, container_type)
+                .map(|selection_set| {
+                    QueryPlan::Fetch(FetchDefinition {
+                        name,
+                        arguments,
+                        variables,
+                        directives,
+                        selection_set,
+                        representations,
+                        type_name,
+                        service,
+                    })
                 }),
             QueryPlan::Flatten { select, plan } => self
                 .iter(*plan, container_type)
@@ -127,7 +146,6 @@ mod test {
 
     fn setup(graphql: &str) -> Index {
         let document = async_graphql_parser::parse_schema(graphql).unwrap();
-
         Blueprint::parse_doc(document).to_index()
     }
 
@@ -137,11 +155,12 @@ mod test {
         let index = setup(include_str!(
             "../../../blueprint/src/fixtures/router.graphql"
         ));
-        let doc = async_graphql_parser::parse_query(query).unwrap();
-
         let qp = QueryPlan::try_new(&query).unwrap();
 
-        let enriched_selection_set = Enrich::new(index).transform(qp).to_result().unwrap();
+        let enriched_selection_set = Enrich::new(Rc::new(index))
+            .transform(qp)
+            .to_result()
+            .unwrap();
 
         insta::assert_debug_snapshot!(enriched_selection_set)
     }
