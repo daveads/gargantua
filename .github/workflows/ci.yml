@@ -1,11 +1,13 @@
 name: CI
+
 'on':
   push:
     branches:
-      - main
+      - test
   pull_request:
     branches:
-      - main
+      - test
+
 jobs:
   Test:
     runs-on: ubuntu-latest
@@ -14,11 +16,17 @@ jobs:
         uses: actions/checkout@v4
       - name: Run Tests
         run: cargo test --workspace
+
   WASM:
     runs-on: ubuntu-latest
     steps:
-      - run: rustup target add wasm32-unknown-unknown
-      - run: cargo build --target wasm32-unknown-unknown --workspace
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Add WASM target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Build WASM
+        run: cargo build --target wasm32-unknown-unknown --workspace
+
   Validate:
     runs-on: ubuntu-latest
     steps:
@@ -33,3 +41,23 @@ jobs:
           npm i
           npm run build
           npm run check-workflows
+
+  Rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+      - name: Run rustfmt
+        run: cargo fmt -- --check
+
+  Clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install clippy
+        run: rustup component add clippy
+      - name: Run clippy test
+        run: cargo clippy -- -D warnings
